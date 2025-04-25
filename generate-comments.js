@@ -235,6 +235,28 @@ async function updateComment(postId, date, content) {
   }
 }
 
+// 添加更新文章 frontmatter 的函数
+async function updatePostExcerpt(post, summary) {
+  try {
+    const postPath = post.full_source;
+    const content = await fs.readFile(postPath, 'utf8');
+    const { data, content: postContent } = matter(content);
+    
+    // 更新 frontmatter
+    data.excerpt = summary;
+    
+    // 重新组装文章内容
+    const updatedContent = matter.stringify(postContent, data);
+    await fs.writeFile(postPath, updatedContent);
+    
+    await logger.log(`更新文章摘要成功: ${post.title}`);
+    return true;
+  } catch (error) {
+    await logger.error(`更新文章摘要失败: ${error.message}`);
+    return false;
+  }
+}
+
 // 添加读取 Hexo 数据库的函数
 async function loadHexoDb() {
   try {
@@ -247,7 +269,7 @@ async function loadHexoDb() {
 }
 
 // 修改主程序入口，接入 Hexo
-hexo.extend.filter.register('after_generate', async function() {
+hexo.extend.filter.register('before_generate', async function() {
   const log = this.log || console;
   log.info('DeepSeek Comments: 开始处理评论...');
   
@@ -324,9 +346,14 @@ hexo.extend.filter.register('after_generate', async function() {
             continue;
           }
           
-          await updateComment(postId, new Date(post.date), newSummary);
+          // 更新评论和文章摘要
+          await Promise.all([
+            updateComment(postId, new Date(post.date), newSummary),
+            updatePostExcerpt(post, newSummary)
+          ]);
+          
           updatedCount++;
-          log.info(`更新文章评论: ${postTitle}`);
+          log.info(`更新文章评论和摘要: ${postTitle}`);
         } else {
           skippedCount++;
           if (timeDiff <= config.timeThreshold.updateInterval) {
@@ -343,9 +370,14 @@ hexo.extend.filter.register('after_generate', async function() {
           continue;
         }
         
-        await postComment(summary, postId, new Date(post.date));
+        // 添加评论和更新文章摘要
+        await Promise.all([
+          postComment(summary, postId, new Date(post.date)),
+          updatePostExcerpt(post, summary)
+        ]);
+        
         processedCount++;
-        log.info(`添加新评论: ${postTitle}`);
+        log.info(`添加新评论和摘要: ${postTitle}`);
       }
     }
     
