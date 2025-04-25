@@ -22,13 +22,18 @@ const config = {
     collection: 'comment'
   },
   hexo: {
-    postsDir: './source/_posts'
+    postsDir: './source/_posts',
+    dbPath: 'D:/blog/db.json'  // Hexo 的数据库文件路径
   },
   logging: {
     enabled: true,
     consoleOutput: true,
     fileOutput: false,
     logFile: './logs/app.log'
+  },
+  timeThreshold: {
+    // 设置 1 分钟的更新时间阈值（单位：毫秒）
+    updateInterval: 1 * 60 * 1000
   }
 };
 
@@ -206,64 +211,168 @@ async function postComment(content, postId, date) {
   }
 }
 
+// 更新评论
+async function updateComment(postId, date, content) {
+  await logger.log(`开始更新文章 ${postId} 的评论`);
+  
+  const { year, month, day } = getUtcDatePath(date);
+  const encodedPostId = encodeUrlPath(postId);
+  const urlPath = `/${year}/${month}/${day}/${encodedPostId}/`;
+  
+  try {
+    const collection = dbManager.getCollection(config.mongodb.collection);
+    const updatedComment = {
+      comment: `<p>${content}</p>`,
+      updated: new Date()
+    };
+
+    await collection.updateOne({ url: urlPath, nick: config.deepseek.botName }, { $set: updatedComment });
+    await logger.log(`评论更新成功: ${postId}`);
+    return true;
+  } catch (error) {
+    await logger.error(`Update comment error for ${postId}: ${error.message}`);
+    return null;
+  }
+}
+
+// 添加读取 Hexo 数据库的函数
+async function loadHexoDb() {
+  try {
+    const data = await fs.readFile(config.hexo.dbPath, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    await logger.error(`读取 db.json 失败: ${error.message}`);
+    return null;
+  }
+}
+
 // 修改主程序入口，接入 Hexo
 hexo.extend.filter.register('after_generate', async function() {
   const log = this.log || console;
   log.info('DeepSeek Comments: 开始处理评论...');
   
   try {
-    // 建立数据库连接
     await dbManager.connect();
     
-    // 获取所有文章并过滤掉草稿
-    const posts = this.locals.get('posts').data
-      .filter(post => !post.draft);
+    // 读取 Hexo 数据库
+    const hexoDb = await loadHexoDb();
+    if (!hexoDb || !hexoDb.models || !hexoDb.models.Post) {
+      throw new Error('无法读取 Hexo 数据库');
+    }
+
+    // 获取所有文章
+    const posts = this.locals.get('posts').data;
+    const collection = dbManager.getCollection(config.mongodb.collection);
     
-    log.info(`找到 ${posts.length} 篇文章`);
+    // 从 db.json 创建文章映射表
+    const postMap = new Map(
+      hexoDb.models.Post.map(post => [post._id, post])
+    );
     
+    // 获取所有已有的 DeepSeek 评论
+    const existingComments = await collection.find({
+      nick: config.deepseek.botName
+    }).toArray();
+    
+    const commentMap = new Map(
+      existingComments.map(comment => [comment.url, comment])
+    );
+    
+    // 处理当前文章
     let processedCount = 0;
     let skippedCount = 0;
+    let updatedCount = 0;
     
     for (const post of posts) {
-      // 使用 post.title 作为日志标识
+      if (post.draft) {
+        skippedCount++;
+        continue;
+      }
+      
       const postTitle = post.title || '无标题';
       const postId = post.slug || path.basename(post.source, '.md');
+      const { year, month, day } = getUtcDatePath(new Date(post.date));
       const encodedPostId = encodeUrlPath(postId);
+      const urlPath = `/${year}/${month}/${day}/${encodedPostId}/`;
       
-      log.info(`处理文章: ${postTitle} (${postId})`);
-      
-      // 检查是否已有评论
-      if (await hasExistingComment(encodedPostId, new Date(post.date))) {
+      // 从 Hexo 数据库中获取文章数据
+      const hexoPost = postMap.get(post._id);
+      if (!hexoPost) {
+        log.warn(`找不到文章的数据库记录: ${postTitle}`);
         skippedCount++;
-        log.info(`跳过文章: ${postTitle} (已有评论)`);
         continue;
       }
       
-      // 使用 post._content 获取原始内容
-      const summary = await getSummary(post._content || post.raw || post.content);
-      if (!summary) {
-        skippedCount++;
-        log.warn(`跳过文章: ${postTitle} (生成摘要失败)`);
-        continue;
-      }
+      log.info(`处理文章: ${postTitle} (修改时间: ${hexoPost.updated})`);
       
-      // 发布评论
-      await postComment(summary, postId, new Date(post.date));
-      processedCount++;
-      log.info(`处理完成: ${postTitle}`);
+      const existingComment = commentMap.get(urlPath);
+      
+      // 使用 Hexo 的 updated 字段判断文章是否更新
+      if (existingComment) {
+        const commentDate = new Date(existingComment.updated);
+        const modifiedDate = new Date(hexoPost.updated);
+        
+        // 计算时间差（毫秒）
+        const timeDiff = Math.abs(modifiedDate - commentDate);
+        
+        // 如果文章更新时间晚于评论时间，且时间差大于阈值，则更新评论
+        if (modifiedDate > commentDate && timeDiff > config.timeThreshold.updateInterval) {
+          log.info(`更新评论: ${postTitle} (修改时间: ${modifiedDate}, 评论时间: ${commentDate}, 时间差: ${Math.round(timeDiff/1000)}秒)`);
+          const newSummary = await getSummary(post._content);
+          if (!newSummary) {
+            skippedCount++;
+            continue;
+          }
+          
+          await updateComment(postId, new Date(post.date), newSummary);
+          updatedCount++;
+          log.info(`更新文章评论: ${postTitle}`);
+        } else {
+          skippedCount++;
+          if (timeDiff <= config.timeThreshold.updateInterval) {
+            log.info(`跳过文章: ${postTitle} (时间差小于${config.timeThreshold.updateInterval/1000}秒)`);
+          } else {
+            log.info(`跳过文章: ${postTitle} (内容未变化)`);
+          }
+        }
+      } else {
+        // 新文章，添加评论
+        const summary = await getSummary(post._content);
+        if (!summary) {
+          skippedCount++;
+          continue;
+        }
+        
+        await postComment(summary, postId, new Date(post.date));
+        processedCount++;
+        log.info(`添加新评论: ${postTitle}`);
+      }
+    }
+    
+    // 清理不存在文章的评论
+    const currentUrls = new Set(posts.map(post => {
+      const { year, month, day } = getUtcDatePath(new Date(post.date));
+      const encodedPostId = encodeUrlPath(post.slug || path.basename(post.source, '.md'));
+      return `/${year}/${month}/${day}/${encodedPostId}/`;
+    }));
+    
+    for (const [url, comment] of commentMap) {
+      if (!currentUrls.has(url)) {
+        await collection.deleteOne({ _id: comment._id });
+        log.info(`删除已移除文章的评论: ${url}`);
+      }
     }
     
     log.info('DeepSeek Comments: 处理完成');
     log.info(`总文章数: ${posts.length}`);
     log.info(`处理成功: ${processedCount}`);
     log.info(`跳过文章: ${skippedCount}`);
+    log.info(`更新评论: ${updatedCount}`);
     
   } catch (error) {
     log.error('DeepSeek Comments 错误:', error.message);
-    // 打印更详细的错误信息
     console.error(error);
   } finally {
-    // 关闭数据库连接
     await dbManager.close();
   }
 });
@@ -271,5 +380,6 @@ hexo.extend.filter.register('after_generate', async function() {
 // 导出主要函数供其他模块使用
 module.exports = {
   getSummary,
-  postComment
+  postComment,
+  updateComment
 };
